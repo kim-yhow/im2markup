@@ -30,6 +30,7 @@ function DataGen:__init(data_base_dir, data_path, label_path, max_aspect_ratio, 
         log = print
     end
     local file, err = io.open(self.data_path, "r")
+
     if err then 
         file, err = io.open(paths.concat(self.data_base_dir, self.data_path), "r")
         if err then
@@ -45,7 +46,9 @@ function DataGen:__init(data_base_dir, data_path, label_path, max_aspect_ratio, 
         if idx % 1000000==0 then
             log (string.format('%d lines read', idx))
         end
-        local filename, label = unpack(split(line))
+
+        local filename, label = table.unpack(split(line))
+        --print("data_gen.lua.51", filename, label)
         self.lines[idx] = tds.Vec({filename, label})
     end
     collectgarbage()
@@ -67,13 +70,13 @@ function DataGen:nextBatch(batch_size)
             break
         end
         local img_path = self.lines[self.cursor][1]
-        local status, img = pcall(image.load, paths.concat(self.data_base_dir, img_path))
+        local status, img = pcall(image.load, paths.concat(self.data_base_dir, img_path))       -- pcall 第一个返回值，判断pcall中函数是否有问题。 第二个是输入的函数的返回值
         if not status then
             self.cursor = self.cursor + 1
-            log(img_path)
+            log(img_path.."_no_status")
         else
             local label_str = self.lines[self.cursor][2]
-            local label_list = path2numlist(label_str, self.label_path)
+            local label_list = path2numlist(label_str, self.label_path)         -- 将label转为int数值
             self.cursor = self.cursor + 1
             img = 255.0*image.rgb2y(img)
             local origH = img:size()[2]
@@ -101,10 +104,10 @@ function DataGen:nextBatch(batch_size)
                 if self.buffer[imgW][imgH] == nil then
                     self.buffer[imgW][imgH] = {}
                 end
-                table.insert(self.buffer[imgW][imgH], {img:clone(), label_list, img_path})
+                table.insert(self.buffer[imgW][imgH], {img:clone(), label_list, img_path})      -- {img, int的标签， 图片名称}
                 if #self.buffer[imgW][imgH] == batch_size then
                     local images = torch.Tensor(batch_size, 1, imgH, imgW)
-                    local max_target_length = -math.huge
+                    local max_target_length = -math.huge            -- 无穷小
                     -- visualize
                     local img_paths = {}
                     for i = 1, #self.buffer[imgW][imgH] do
@@ -126,7 +129,7 @@ function DataGen:nextBatch(batch_size)
                     end
                     self.buffer[imgW][imgH] = nil
                     --collectgarbage()
-                    do return {images, targets, targets_eval, num_nonzeros, img_paths} end
+                    do return {images, targets, targets_eval, num_nonzeros, img_paths} end   -- {img主体，label, label_eval, label中非0的token个数, 图片名称}
                 end
             else
                 log(string.format('WARNING: %s is too large, will be ignored. Consider using a larger max_image_width or max_image_height'%img_path))

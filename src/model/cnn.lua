@@ -1,6 +1,5 @@
 function createCNNModel(use_cuda)
     local model = nn.Sequential()
-
     -- input shape: (batch_size, 1, imgH, imgW)
     -- CNN part
     model:add(nn.AddConstant(-128.0))
@@ -37,7 +36,8 @@ function createCNNModel(use_cuda)
     -- (batch_size, 512, H, W)    
 
     model:add(nn.Transpose({2, 3}, {3,4})) -- (batch_size, H, W, 512)
-    model:add(nn.SplitTable(1, 3)) -- #H list of (batch_size, W, 512)
+    --model:add(nn.SplitTable(1, 3)) -- #H list of (batch_size, W, 512)
+
     --model:add(nn.Copy('torch.CudaTensor', 'torch.FloatTensor', false, true))
     --model:cuda()
     return model

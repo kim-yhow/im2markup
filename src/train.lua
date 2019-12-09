@@ -11,6 +11,8 @@ package.path = package.path .. ';src/?.lua' .. ';src/data/?.lua' .. ';src/utils/
 require 'model'
 require 'data_gen'
 require 'logging'
+
+
 cmd = torch.CmdLine()
 
 -- Input and Output
@@ -22,6 +24,7 @@ cmd:option('-data_path', '/n/rush_lab/data/image_data/im2latex_train_large_filte
 cmd:option('-label_path', '/n/rush_lab/data/image_data/im2latex_formulas.norm4.final.lst', [[The path containing data file names and labels. Format per line: image_path characters]])
 cmd:option('-val_data_path', '/n/rush_lab/data/image_data/im2latex_validate_large_filter.lst', [[The path containing validate data file names and labels. Format per line: image_path characters]])
 cmd:option('-model_dir', 'model', [[The directory for saving and loading model parameters (structure is not stored)]])
+cmd:option('-model_name', 'final-model', [[The directory for saving and loading model parameters (structure is not stored)]])
 cmd:option('-log_path', 'log.txt', [[The path to put log]])
 cmd:option('-output_dir', 'results', [[The path to put visualization results if visualize is set to True]])
 
@@ -54,6 +57,7 @@ cmd:option('-decoder_num_layers', 1, [[Number of hidden units in decoder cell]])
 cmd:option('-vocab_file', '', [[Vocabulary file. A token per line.]])
 
 -- Other
+cmd:option('-colrow', false, [[use the colrow encoder]])
 cmd:option('-phase', 'test', [[train or test]])
 cmd:option('-gpu_id', 1, [[Which gpu to use. <=0 means use CPU]])
 cmd:option('-load_model', false, [[Load model from model-dir or not]])
@@ -68,7 +72,7 @@ opt = cmd:parse(arg)
 torch.manualSeed(opt.seed)
 math.randomseed(opt.seed)
 
-function train(model, phase, batch_size, num_epochs, train_data, val_data, model_dir, steps_per_checkpoint, num_batches_val, beam_size, visualize, output_dir, trie, learning_rate_init, lr_decay, start_decay_at)
+function train(model, phase, batch_size, num_epochs, train_data, val_data, model_dir, steps_per_checkpoint, num_batches_val, beam_size, visualize, output_dir, trie, learning_rate_init, lr_decay, start_decay_at, colrow)
     local loss = 0
     local num_seen = 0
     local num_samples = 0
@@ -102,14 +106,17 @@ function train(model, phase, batch_size, num_epochs, train_data, val_data, model
             model.optim_state.learningRate = math.max(learning_rate, opt.learning_rate_min)
             logging:info(string.format('Decay lr, current lr: %f', learning_rate))
         end
+         i = 0
         while true do
             train_batch = train_data:nextBatch(batch_size)
             if train_batch == nil then
                 break
             end
             local real_batch_size = train_batch[1]:size()[1]
+            --  return loss, self.grad_params, {num_nonzeros, accuracy}
             local step_loss, stats = model:step(train_batch, forward_only, beam_size, trie)
-            logging:info(string.format('%f', math.exp(step_loss/stats[1])))
+            print(step_loss, stats)
+            logging:info(string.format('step_loss: %f, num: %d' , math.exp(step_loss/stats[1]), i))
             num_seen = num_seen + 1
             num_samples = num_samples + real_batch_size
             num_nonzeros = num_nonzeros + stats[1]
@@ -147,6 +154,7 @@ function train(model, phase, batch_size, num_epochs, train_data, val_data, model
                     collectgarbage()
                 end
             end
+            i = i + 1
         end -- while true
         if not forward_only then
             -- Evaluate on val data
@@ -207,6 +215,7 @@ function main()
     local num_epochs = opt.num_epochs
 
     local model_dir = opt.model_dir
+    local model_name = opt.model_name
     local load_model = opt.load_model
     local steps_per_checkpoint = opt.steps_per_checkpoint
     local num_batches_val = opt.num_batches_val
@@ -221,6 +230,8 @@ function main()
     opt.max_decoder_l = opt.max_num_tokens+1
     opt.max_encoder_l_w = math.floor(opt.max_image_width / 8.0)
     opt.max_encoder_l_h = math.floor(opt.max_image_height / 8.0)
+
+
     if gpu_id > 0 then
         logging:info(string.format('Using CUDA on GPU %d', gpu_id))
         require 'cutorch'
@@ -236,7 +247,8 @@ function main()
     -- Build model
     logging:info('Building model')
     local model = Model()
-    local final_model = paths.concat(model_dir, 'final-model')
+    --local final_model = paths.concat(model_dir, 'final-model')
+    local final_model = paths.concat(model_dir, model_name)
     if load_model and paths.filep(final_model) then
         logging:info(string.format('Loading model from %s', final_model))
         model:load(final_model, opt)
@@ -255,7 +267,7 @@ function main()
             if string.len(vocab) == 0 then
                 vocab = ' '
             end
-            id2vocab[#id2vocab+1] = vocab
+            id2vocab[#id2vocab+1] = vocab       -- # 返回长度           hash表 {1:. 2:. ...}
         end
         opt.target_vocab_size = #id2vocab+4
         model:create(opt)
@@ -273,7 +285,15 @@ function main()
     -- Load data
     logging:info(string.format('Data base dir %s', opt.data_base_dir))
     logging:info(string.format('Load training data from %s', opt.data_path))
-    local train_data = DataGen(opt.data_base_dir, opt.data_path, opt.label_path, 10.0, opt.max_encoder_l_h, opt.max_encoder_l_w, opt.max_decoder_l)
+    --  -val_data_path data/full/im2latex_validate_filter.lst  -vocab_file data/full/latex_vocab     .txt -max_num_tokens 150 -max_image_width 500 -max_image_height 160 -batch_size 20 -beam_size 1
+   -- train_data {img主体，label, label_eval, label中非0的token个数, 图片名称}
+    local train_data = DataGen(opt.data_base_dir,  --  -data_base_dir data/full/formula_images_processed/
+            opt.data_path,                         --  -data_path data/full/im2latex_train_filter.lst     matching
+            opt.label_path,                        --  -label_path data/full/im2latex_formulas.norm.lst   formula str
+            10.0,
+            opt.max_encoder_l_h,
+            opt.max_encoder_l_w,
+            opt.max_decoder_l)
     logging:info(string.format('Training data loaded from %s', opt.data_path))
     local val_data
     if phase == 'train' then
@@ -286,8 +306,8 @@ function main()
         logging:info(string.format('Load dictionary from %s', opt.dictionary_path))
         trie = loadDictionary(opt.dictionary_path, opt.allow_digit_prefix)
     end
-    train(model, phase, batch_size, num_epochs, train_data, val_data, model_dir, steps_per_checkpoint, num_batches_val, beam_size, visualize, output_dir, trie, opt.learning_rate, opt.lr_decay, opt.start_decay_at)
 
+    train(model, phase, batch_size, num_epochs, train_data, val_data, model_dir, steps_per_checkpoint, num_batches_val, beam_size, visualize, output_dir, trie, opt.learning_rate, opt.lr_decay, opt.start_decay_at, opt.colrow)
     logging:shutdown()
     model:shutdown()
 end

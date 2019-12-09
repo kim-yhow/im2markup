@@ -7,6 +7,7 @@ require 'paths'
 
 package.path = package.path .. ';src/?.lua' .. ';src/utils/?.lua' .. ';src/model/?.lua' .. ';src/optim/?.lua'
 require 'cnn'
+require 'transfer'
 require 'LSTM'
 require 'output_projector'
 require 'criterion'
@@ -62,6 +63,10 @@ function model:load(model_path, config)
     self.global_step = checkpoint[3]
     self.optim_state = checkpoint[4]
     id2vocab = checkpoint[5]
+--torch.save(model_path,
+--{
+    --{self.cnn_model, self.encoder_fw, self.encoder_bw, self.encoder_fw_col, self.encoder_bw_col, self.decoder, self.output_projector, self.pos_embedding_fw, self.pos_embedding_bw, self.pos_embedding_fw_col, self.pos_embedding_bw_col}, self.config, self.global_step, self.optim_state, id2vocab})
+    --{self.cnn_model, self.encoder_fw, self.encoder_bw,                                           self.decoder, self.output_projector, self.pos_embedding_fw, self.pos_embedding_bw}, self.config, self.global_step, self.optim_state, id2vocab})
 
     -- Load model structure parameters
     self.cnn_feature_size = 512
@@ -98,15 +103,15 @@ end
 function model:create(config)
     self.cnn_feature_size = 512
     self.dropout = config.dropout
-    self.encoder_num_hidden = config.encoder_num_hidden
-    self.encoder_num_layers = config.encoder_num_layers
-    self.decoder_num_hidden = config.encoder_num_hidden * 2
+    self.encoder_num_hidden = config.encoder_num_hidden       -- 256
+    self.encoder_num_layers = config.encoder_num_layers       -- 1
+    self.decoder_num_hidden = config.encoder_num_hidden * 2   -- 256*2 = 512
     self.decoder_num_layers = config.decoder_num_layers
     self.target_vocab_size = config.target_vocab_size
     self.target_embedding_size = config.target_embedding_size
     self.max_encoder_l_w = config.max_encoder_l_w
     self.max_encoder_l_h = config.max_encoder_l_h
-    self.max_decoder_l = config.max_decoder_l
+    self.max_decoder_l = config.max_decoder_l                   -- 最大长度+1 151
     self.input_feed = config.input_feed
     self.batch_size = config.batch_size
     self.prealloc = config.prealloc
@@ -114,11 +119,23 @@ function model:create(config)
 
     self.pos_embedding_fw = nn.Sequential():add(nn.LookupTable(self.max_encoder_l_h,self.encoder_num_layers*self.encoder_num_hidden*2))
     self.pos_embedding_bw = nn.Sequential():add(nn.LookupTable(self.max_encoder_l_h, self.encoder_num_layers*self.encoder_num_hidden*2))
-    -- CNN model, input size: (batch_size, 1, 32, width), output size: (batch_size, sequence_length, 512)
+
+    self.pos_embedding_fw_col = nn.Sequential():add(nn.LookupTable(self.max_encoder_l_w,self.encoder_num_layers*self.encoder_num_hidden*2))
+    self.pos_embedding_bw_col = nn.Sequential():add(nn.LookupTable(self.max_encoder_l_w, self.encoder_num_layers*self.encoder_num_hidden*2))
+
+
     self.cnn_model = createCNNModel()
+    self.row_transfer = Rowtransfer()
+    self.col_transfer = Coltransfer()
+
+
     -- createLSTM(input_size, num_hidden, num_layers, dropout, use_attention, input_feed, use_lookup, vocab_size)
     self.encoder_fw = createLSTM(self.cnn_feature_size, self.encoder_num_hidden, self.encoder_num_layers, self.dropout, false, false, false, nil, self.batch_size, self.max_encoder_l, 'encoder-fw')
     self.encoder_bw = createLSTM(self.cnn_feature_size, self.encoder_num_hidden, self.encoder_num_layers, self.dropout, false, false, false, nil, self.batch_size, self.max_encoder_l, 'encoder-bw')
+
+    self.encoder_fw_col = createLSTM(self.cnn_feature_size, self.encoder_num_hidden, self.encoder_num_layers, self.dropout, false, false, false, nil, self.batch_size, self.max_encoder_l, 'encoder-fw-col')
+    self.encoder_bw_col = createLSTM(self.cnn_feature_size, self.encoder_num_hidden, self.encoder_num_layers, self.dropout, false, false, false, nil, self.batch_size, self.max_encoder_l, 'encoder-bw-col')
+
     self.decoder = createLSTM(self.target_embedding_size, self.decoder_num_hidden, self.decoder_num_layers, self.dropout, true, self.input_feed, true, self.target_vocab_size, self.batch_size, self.max_encoder_l, 'decoder')
     self.output_projector = createOutputUnit(self.decoder_num_hidden, self.target_vocab_size)
     self.global_step = 0
@@ -169,7 +186,7 @@ function model:_build()
     self.criterion = createCriterion(self.target_vocab_size)
 
     -- convert to cuda if use gpu
-    self.layers = {self.cnn_model, self.encoder_fw, self.encoder_bw, self.decoder, self.output_projector, self.pos_embedding_fw, self.pos_embedding_bw}
+    self.layers = {self.cnn_model, self.encoder_fw, self.encoder_bw, self.encoder_fw_col, self.encoder_bw_col, self.decoder, self.output_projector, self.pos_embedding_fw, self.pos_embedding_bw, self.pos_embedding_fw_col, self.pos_embedding_bw_col}
     for i = 1, #self.layers do
         localize(self.layers[i])
     end
@@ -178,8 +195,14 @@ function model:_build()
     self.context_proto = localize(torch.zeros(self.batch_size, self.max_encoder_l_w*self.max_encoder_l_h, 2*self.encoder_num_hidden))
     self.encoder_fw_grad_proto = localize(torch.zeros(self.batch_size, self.max_encoder_l_w*self.max_encoder_l_h, self.encoder_num_hidden))
     self.encoder_bw_grad_proto = localize(torch.zeros(self.batch_size, self.max_encoder_l_w*self.max_encoder_l_h, self.encoder_num_hidden))
+
+    self.encoder_fw_grad_proto_col = localize(torch.zeros(self.batch_size, self.max_encoder_l_w*self.max_encoder_l_h, self.encoder_num_hidden))
+    self.encoder_bw_grad_proto_col = localize(torch.zeros(self.batch_size, self.max_encoder_l_w*self.max_encoder_l_h, self.encoder_num_hidden))
+
     self.cnn_grad_proto = localize(torch.zeros(self.max_encoder_l_h, self.batch_size, self.max_encoder_l_w, self.cnn_feature_size))
+    self.cnn_grad_proto_col = localize(torch.zeros(self.max_encoder_l_w, self.batch_size, self.max_encoder_l_h, self.cnn_feature_size))
     self.pos_embedding_grad_fw_proto = localize(torch.zeros(self.batch_size, self.encoder_num_layers*self.encoder_num_hidden*2))
+    self.pos_embedding_grad_fw_proto_col = localize(torch.zeros(self.batch_size, self.encoder_num_layers*self.encoder_num_hidden*2))
 
     local num_params = 0
     self.params, self.grad_params = {}, {}
@@ -195,9 +218,13 @@ function model:_build()
     log(string.format('Number of parameters: %d', num_params))
 
     self.decoder_clones = clone_many_times(self.decoder, self.max_decoder_l)
-    self.encoder_fw_clones = clone_many_times(self.encoder_fw, self.max_encoder_l_w)
+    self.encoder_fw_clones = clone_many_times(self.encoder_fw, self.max_encoder_l_w)        -- 复制多个
     self.encoder_bw_clones = clone_many_times(self.encoder_bw, self.max_encoder_l_w)
-    
+
+    self.encoder_fw_clones_col = clone_many_times(self.encoder_fw_col, self.max_encoder_l_h)        -- 复制多个
+    self.encoder_bw_clones_col = clone_many_times(self.encoder_bw_col, self.max_encoder_l_h)
+    --print('self.encoder_fw_clones', #self.encoder_fw_clones)        -- 62
+
     for i = 1, #self.encoder_fw_clones do
         if self.encoder_fw_clones[i].apply then
             self.encoder_fw_clones[i]:apply(function(m) m:setReuse() end)
@@ -210,12 +237,26 @@ function model:_build()
             if self.prealloc then self.encoder_bw_clones[i]:apply(function(m) m:setPrealloc() end) end
         end
     end
+    for i = 1, #self.encoder_fw_clones_col do
+        if self.encoder_fw_clones_col[i].apply then
+            self.encoder_fw_clones_col[i]:apply(function(m) m:setReuse() end)
+            if self.prealloc then self.encoder_fw_clones_col[i]:apply(function(m) m:setPrealloc() end) end
+        end
+    end
+    for i = 1, #self.encoder_bw_clones_col do
+        if self.encoder_bw_clones_col[i].apply then
+            self.encoder_bw_clones_col[i]:apply(function(m) m:setReuse() end)
+            if self.prealloc then self.encoder_bw_clones_col[i]:apply(function(m) m:setPrealloc() end) end
+        end
+    end
+
     for i = 1, #self.decoder_clones do
         if self.decoder_clones[i].apply then
             self.decoder_clones[i]:apply(function (m) m:setReuse() end)
             if self.prealloc then self.decoder_clones[i]:apply(function(m) m:setPrealloc() end) end
         end
     end
+
     -- initalial states
     local encoder_h_init = localize(torch.zeros(self.batch_size, self.encoder_num_hidden))
     local decoder_h_init = localize(torch.zeros(self.batch_size, self.decoder_num_hidden))
@@ -240,7 +281,7 @@ function model:_build()
         table.insert(self.init_bwd_dec, decoder_h_init:clone())
         table.insert(self.init_bwd_dec, decoder_h_init:clone()) 
     end
-    self.dec_offset = 3 -- offset depends on input feeding
+    self.dec_offset = 3 -- offset depends on input feeding: Whether or not use LSTM attention decoder cell
     if self.input_feed then
         self.dec_offset = self.dec_offset + 1
     end
@@ -288,10 +329,12 @@ function model:step(batch, forward_only, beam_size, trie)
             collectgarbage()
         end
     end
+
     local input_batch = localize(batch[1])
     local target_batch = localize(batch[2])
     local target_eval_batch = localize(batch[3])
     local num_nonzeros = batch[4]
+
     local img_paths
     if self.visualize then
         img_paths = batch[5]
@@ -324,12 +367,80 @@ function model:step(batch, forward_only, beam_size, trie)
     local feval = function(p) --cut off when evaluate
         target = target_batch:transpose(1,2)
         target_eval = target_eval_batch:transpose(1,2)
-        local cnn_output_list = self.cnn_model:forward(input_batch) -- list of (batch_size, W, 512)
+        --print('target_batch', target_batch)     -- 20x140
+        --print('target', target)                 -- 140x20
+
+        --local cnn_output_list= self.cnn_model:forward(input_batch) -- list of (batch_size, W, 512)
+        local cnn_output= self.cnn_model:forward(input_batch)
+        -- 'cnn_output'20 ,imgW, imgH ,512
+
+        local cnn_list_row = self.row_transfer:forward(cnn_output)  -- list of (batch_size, W, 512)
+        local cnn_list_col = self.col_transfer:forward(cnn_output)  -- list of (batch_size, H, 512)
+
         local counter = 1
-        local imgH = #cnn_output_list
-        local source_l = cnn_output_list[1]:size()[2]
+        local imgH = #cnn_list_row
+        local imgW = #cnn_list_col
+
+        local source_l = cnn_list_row[1]:size()[2]
+        local source_col = cnn_list_col[1]:size()[2]
         local context = self.context_proto[{{1, batch_size}, {1, source_l*imgH}}]
+        local context_col = self.context_proto[{{1, batch_size}, {1, source_l*imgH}}]
         assert(source_l <= self.max_encoder_l_w, string.format('max_encoder_l_w (%d) < source_l (%d)!', self.max_encoder_l_w, source_l))
+
+
+        for i = 1, imgW do
+            if forward_only then
+                self.pos_embedding_fw_col:evaluate()
+                self.pos_embedding_bw_col:evaluate()
+            else
+                self.pos_embedding_fw_col:training()
+                self.pos_embedding_bw_col:training()
+            end
+            local pos = localize(torch.zeros(batch_size)):fill(i)
+
+            local pos_embedding_fw_col  = self.pos_embedding_fw_col:forward(pos)
+            local pos_embedding_bw_col  = self.pos_embedding_bw_col:forward(pos)
+
+            local cnn_output = cnn_list_col[i] --1, imgH, 512
+            source = cnn_output:transpose(1,2) --imgH, 1, 512
+            -- forward encoder
+            local rnn_state_enc = reset_state(self.init_fwd_enc, batch_size, 0)
+            for l = 1, self.encoder_num_layers do
+                rnn_state_enc[0][l*2-1]:copy(pos_embedding_fw_col[{{},{(l*2-2)*self.encoder_num_hidden+1, (l*2-1)*self.encoder_num_hidden}}])
+                rnn_state_enc[0][l*2]:copy(pos_embedding_fw_col[{{},{(l*2-1)*self.encoder_num_hidden+1, (l*2)*self.encoder_num_hidden}}])
+            end
+            for  t = 1, source_col do                -- 从大到小
+                counter = (i-1)*source_col + t
+                if not forward_only then
+                    self.encoder_fw_clones_col[t]:training()
+                else
+                    self.encoder_fw_clones_col[t]:evaluate()
+                end
+                local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
+                local out = self.encoder_fw_clones_col[t]:forward(encoder_input)
+                rnn_state_enc[t] = out
+                context_col[{{},counter, {1, self.encoder_num_hidden}}]:copy(out[#out])
+            end
+
+            local rnn_state_enc_bwd = reset_state(self.init_fwd_enc, batch_size, source_col+1)
+            for l = 1, self.encoder_num_layers do
+                rnn_state_enc_bwd[source_col+1][l*2-1]:copy(pos_embedding_bw_col[{{},{(l*2-2)*self.encoder_num_hidden+1, (l*2-1)*self.encoder_num_hidden}}])
+                rnn_state_enc_bwd[source_col+1][l*2]:copy(pos_embedding_bw_col[{{},{(l*2-1)*self.encoder_num_hidden+1, (l*2)*self.encoder_num_hidden}}])
+            end
+            for t = source_col, 1, -1 do
+                counter = (i-1)*source_col + t
+                if not forward_only then
+                    self.encoder_bw_clones_col[t]:training()
+                else
+                    self.encoder_bw_clones_col[t]:evaluate()
+                end
+                local encoder_input = {source[t], table.unpack(rnn_state_enc_bwd[t+1])}
+                local out = self.encoder_bw_clones_col[t]:forward(encoder_input)
+                rnn_state_enc_bwd[t] = out
+                context_col[{{},counter, {1+self.encoder_num_hidden, 2*self.encoder_num_hidden}}]:copy(out[#out])
+            end
+        end
+
         for i = 1, imgH do
             if forward_only then
                 self.pos_embedding_fw:evaluate()
@@ -341,8 +452,9 @@ function model:step(batch, forward_only, beam_size, trie)
             local pos = localize(torch.zeros(batch_size)):fill(i)
             local pos_embedding_fw  = self.pos_embedding_fw:forward(pos)
             local pos_embedding_bw  = self.pos_embedding_bw:forward(pos)
-            local cnn_output = cnn_output_list[i] --1, imgW, 512
-            source = cnn_output:transpose(1,2) -- imgW,1,512
+
+            local cnn_output = cnn_list_row[i] --1, imgW, 512
+            source = cnn_output:transpose(1,2) --imgW, 1, 512
             -- forward encoder
             local rnn_state_enc = reset_state(self.init_fwd_enc, batch_size, 0)
             for l = 1, self.encoder_num_layers do
@@ -376,9 +488,16 @@ function model:step(batch, forward_only, beam_size, trie)
                 local encoder_input = {source[t], table.unpack(rnn_state_enc_bwd[t+1])}
                 local out = self.encoder_bw_clones[t]:forward(encoder_input)
                 rnn_state_enc_bwd[t] = out
+
                 context[{{},counter, {1+self.encoder_num_hidden, 2*self.encoder_num_hidden}}]:copy(out[#out])
             end
         end
+
+        context = context + context_col
+
+
+        -- context:size()--(20, 150, 512)
+
         local preds = {}
         local indices
         local rnn_state_dec
@@ -631,6 +750,8 @@ function model:step(batch, forward_only, beam_size, trie)
                 rnn_state_dec[t] = next_state
             end
         end
+
+
         local loss, accuracy = 0.0, 0.0
         if forward_only then
             -- final decoding
@@ -679,6 +800,7 @@ function model:step(batch, forward_only, beam_size, trie)
                 local attn_positions_h = localize(torch.zeros(batch_size, target_l))
                 local attn_positions_w = localize(torch.zeros(batch_size, target_l))
                 rnn_state_dec = reset_state(self.init_fwd_dec, batch_size, 0)
+
                 for t = 1, target_l do
                     self.decoder_clones[t]:evaluate()
                     local decoder_input
@@ -759,11 +881,18 @@ function model:step(batch, forward_only, beam_size, trie)
         else
             local encoder_fw_grads = self.encoder_fw_grad_proto[{{1, batch_size}, {1, source_l*imgH}}]
             local encoder_bw_grads = self.encoder_bw_grad_proto[{{1, batch_size}, {1, source_l*imgH}}]
+
+            local encoder_fw_grads_col = self.encoder_fw_grad_proto_col[{{1, batch_size}, {1, source_l*imgH}}]
+            local encoder_bw_grads_col = self.encoder_bw_grad_proto_col[{{1, batch_size}, {1, source_l*imgH}}]
+
             for i = 1, #self.grad_params do
                 self.grad_params[i]:zero()
             end
             encoder_fw_grads:zero()
             encoder_bw_grads:zero()
+
+            encoder_fw_grads_col:zero()
+            encoder_bw_grads_col:zero()
             local drnn_state_dec = reset_state(self.init_bwd_dec, batch_size)
             for t = target_l, 1, -1 do
                 local pred = self.output_projector:forward(preds[t])
@@ -774,8 +903,13 @@ function model:step(batch, forward_only, beam_size, trie)
                 drnn_state_dec[#drnn_state_dec]:add(dl_dtarget)
                 local decoder_input = {target[t], context, table.unpack(rnn_state_dec[t-1])}
                 local dlst = self.decoder_clones[t]:backward(decoder_input, drnn_state_dec)
+
                 encoder_fw_grads:add(dlst[2][{{}, {}, {1,self.encoder_num_hidden}}])
                 encoder_bw_grads:add(dlst[2][{{}, {}, {self.encoder_num_hidden+1, 2*self.encoder_num_hidden}}])
+
+                encoder_fw_grads_col:add(dlst[2][{{}, {}, {1,self.encoder_num_hidden}}])
+                encoder_bw_grads_col:add(dlst[2][{{}, {}, {self.encoder_num_hidden+1, 2*self.encoder_num_hidden}}])
+
                 drnn_state_dec[#drnn_state_dec]:zero()
                 if self.input_feed then
                     drnn_state_dec[#drnn_state_dec]:copy(dlst[3])
@@ -785,9 +919,96 @@ function model:step(batch, forward_only, beam_size, trie)
                 end
             end
             local cnn_grad = self.cnn_grad_proto[{{1,imgH}, {1,batch_size}, {1,source_l}, {}}]
+            local cnn_grad_col = self.cnn_grad_proto_col[{{1,imgW}, {1,batch_size}, {1,source_col}, {}}]
             -- forward directional encoder
+            for i = 1, imgW do
+                local cnn_output = cnn_list_col[i]
+                source = cnn_output:transpose(1,2)
+
+                assert (source_col == cnn_output:size()[2])
+                local drnn_state_enc = reset_state(self.init_bwd_enc, batch_size)
+                local pos = localize(torch.zeros(batch_size)):fill(i)
+                local pos_embedding_fw_col = self.pos_embedding_fw_col:forward(pos)
+                local pos_embedding_bw_col = self.pos_embedding_bw_col:forward(pos)
+                --local L = self.encoder_num_layers
+                --drnn_state_enc[L*2-1]:copy(drnn_state_dec[1*2-1][{{}, {1, self.encoder_num_hidden}}])
+                --drnn_state_enc[L*2]:copy(drnn_state_dec[1*2][{{}, {1, self.encoder_num_hidden}}])
+                -- forward encoder
+                local rnn_state_enc = reset_state(self.init_fwd_enc, batch_size, 0)
+                for l = 1, self.encoder_num_layers do
+                    rnn_state_enc[0][l*2-1]:copy(pos_embedding_fw_col[{{},{(l*2-2)*self.encoder_num_hidden+1, (l*2-1)*self.encoder_num_hidden}}])
+                    rnn_state_enc[0][l*2]:copy(pos_embedding_fw_col[{{},{(l*2-1)*self.encoder_num_hidden+1, (l*2)*self.encoder_num_hidden}}])
+                end
+                for t = 1, source_col do
+                    if not forward_only then
+                        self.encoder_fw_clones_col[t]:training()
+                    else
+                        self.encoder_fw_clones_col[t]:evaluate()
+                    end
+                    local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
+                    local out = self.encoder_fw_clones_col[t]:forward(encoder_input)
+                    rnn_state_enc[t] = out
+                end
+                local rnn_state_enc_bwd = reset_state(self.init_fwd_enc, batch_size, source_col+1)
+                for l = 1, self.encoder_num_layers do
+                    rnn_state_enc_bwd[source_col+1][l*2-1]:copy(pos_embedding_bw_col[{{},{(l*2-2)*self.encoder_num_hidden+1, (l*2-1)*self.encoder_num_hidden}}])
+                    rnn_state_enc_bwd[source_col+1][l*2]:copy(pos_embedding_bw_col[{{},{(l*2-1)*self.encoder_num_hidden+1, (l*2)*self.encoder_num_hidden}}])
+                end
+                for t = source_col, 1, -1 do
+                    if not forward_only then
+                        self.encoder_bw_clones_col[t]:training()
+                    else
+                        self.encoder_bw_clones_col[t]:evaluate()
+                    end
+                    local encoder_input = {source[t], table.unpack(rnn_state_enc_bwd[t+1])}
+                    local out = self.encoder_bw_clones_col[t]:forward(encoder_input)
+                    rnn_state_enc_bwd[t] = out
+                end
+
+                for t = source_col, 1, -1 do
+                    counter = (i-1)*source_col + t
+                    local encoder_input = {source[t], table.unpack(rnn_state_enc[t-1])}
+                    drnn_state_enc[#drnn_state_enc]:add(encoder_fw_grads_col[{{},counter}])
+                    local dlst = self.encoder_fw_clones_col[t]:backward(encoder_input, drnn_state_enc)
+                    for j = 1, #drnn_state_enc do
+                        drnn_state_enc[j]:copy(dlst[j+1])
+                    end
+                    cnn_grad_col[{i, {}, t, {}}]:copy(dlst[1])
+                end
+                local pos_embedding_grad_col = self.pos_embedding_grad_fw_proto_col[{{1,batch_size}}]
+                for l = 1, self.encoder_num_layers do
+                    pos_embedding_grad_col[{{}, {(l*2-2)*self.encoder_num_hidden+1, (l*2-1)*self.encoder_num_hidden}}]:copy(drnn_state_enc[l*2-1])
+                    pos_embedding_grad_col[{{}, {(l*2-1)*self.encoder_num_hidden+1, (l*2)*self.encoder_num_hidden}}]:copy(drnn_state_enc[l*2])
+                end
+                self.pos_embedding_fw_col:backward(pos, pos_embedding_grad_col)
+                -- backward directional encoder
+                local drnn_state_enc = reset_state(self.init_bwd_enc, batch_size)
+                --local L = self.encoder_num_layers
+                --drnn_state_enc[L*2-1]:copy(drnn_state_dec[1*2-1][{{}, {self.encoder_num_hidden+1, 2*self.encoder_num_hidden}}])
+                --drnn_state_enc[L*2]:copy(drnn_state_dec[1*2][{{}, {self.encoder_num_hidden+1, 2*self.encoder_num_hidden}}])
+                for t = 1, source_col do
+                    counter = (i-1)*source_col + t
+                    local encoder_input = {source[t], table.unpack(rnn_state_enc_bwd[t+1])}
+                    drnn_state_enc[#drnn_state_enc]:add(encoder_bw_grads_col[{{},counter}])
+                    local dlst = self.encoder_bw_clones_col[t]:backward(encoder_input, drnn_state_enc)
+                    for j = 1, #drnn_state_enc do
+                        drnn_state_enc[j]:copy(dlst[j+1])
+                    end
+                    --cnn_grad[{{}, t, {}}]:add(dlst[1])
+                    cnn_grad_col[{i, {}, t, {}}]:add(dlst[1])
+
+                end
+
+                local pos_embedding_grad_col = self.pos_embedding_grad_fw_proto_col[{{1,batch_size}}]
+                for l = 1, self.encoder_num_layers do
+                    pos_embedding_grad_col[{{}, {(l*2-2)*self.encoder_num_hidden+1, (l*2-1)*self.encoder_num_hidden}}]:copy(drnn_state_enc[l*2-1])
+                    pos_embedding_grad_col[{{}, {(l*2-1)*self.encoder_num_hidden+1, (l*2)*self.encoder_num_hidden}}]:copy(drnn_state_enc[l*2])
+                end
+                self.pos_embedding_bw_col:backward(pos, pos_embedding_grad_col)
+            end
+
             for i = 1, imgH do
-                local cnn_output = cnn_output_list[i]
+                local cnn_output = cnn_list_row[i]
                 source = cnn_output:transpose(1,2) -- 128,1,512
                 assert (source_l == cnn_output:size()[2])
                 local drnn_state_enc = reset_state(self.init_bwd_enc, batch_size)
@@ -867,16 +1088,43 @@ function model:step(batch, forward_only, beam_size, trie)
                 end
                 self.pos_embedding_bw:backward(pos, pos_embedding_grad)
             end
+
+
             -- cnn
-            local cnn_final_grad = cnn_grad:split(1, 1)
-            for i = 1, #cnn_final_grad do
-                cnn_final_grad[i] = cnn_final_grad[i]:contiguous():view(batch_size, source_l, -1)
-            end
-            self.cnn_model:backward(input_batch, cnn_final_grad)
+            --cnn_grad= torch.Tensor(cnn_grad)
+
+            cnn_grad = cnn_grad:contiguous():view(batch_size, imgH, imgW, -1)
+
+            cnn_grad_col = cnn_grad_col:contiguous():view(batch_size, imgH, imgW, -1)
+
+            cnn_grad = cnn_grad + cnn_grad_col
+
+
+            self.cnn_model:backward(input_batch, cnn_grad)
+
+            --local cnn_final_grad = cnn_grad:split(1, 1)
+            --local cnn_final_grad_col = cnn_grad_col:split(1,1)
+            --print('cnn_final_grad', cnn_final_grad)
+            --print('cnn_final_grad_col', cnn_final_grad_col)
+            --for i = 1, #cnn_final_grad do
+            --    cnn_final_grad[i] = cnn_final_grad[i]:contiguous():view(batch_size, source_l, -1)
+            --end
+            --for i = 1, #cnn_final_grad_col do
+            --    cnn_final_grad_col[i] = cnn_final_grad_col[i]:contiguous():view(batch_size, source_col, -1)
+            --end
+            --print('cnn_final_grad', cnn_final_grad)
+            --print('cnn_final_grad_col', cnn_final_grad_col)
+
+            --self.cnn_model:backward(input_batch, cnn_final_grad)
+
+
             collectgarbage()
         end
         return loss, self.grad_params, {num_nonzeros, accuracy}
     end
+
+
+
     local optim_state = self.optim_state
     if not forward_only then
         local _, loss, stats = optim.sgd_list(feval, self.params, optim_state); loss = loss[1]
@@ -886,7 +1134,10 @@ function model:step(batch, forward_only, beam_size, trie)
         return loss*batch_size, stats -- todo: accuracy
     end
 end
--- Set visualize phase
+
+
+
+ -- Set visualize phase
 function model:vis(output_dir)
     self.visualize = true
     self.visualize_path = paths.concat(output_dir, 'results.txt')
@@ -928,7 +1179,8 @@ function model:save(model_path)
     for i = 1, #self.layers do
         self.layers[i]:clearState()
     end
-    torch.save(model_path, {{self.cnn_model, self.encoder_fw, self.encoder_bw, self.decoder, self.output_projector, self.pos_embedding_fw, self.pos_embedding_bw}, self.config, self.global_step, self.optim_state, id2vocab})
+    torch.save(model_path, {{self.cnn_model, self.encoder_fw, self.encoder_bw, self.encoder_fw_col, self.encoder_bw_col, self.decoder, self.output_projector, self.pos_embedding_fw, self.pos_embedding_bw, self.pos_embedding_fw_col, self.pos_embedding_bw_col}, self.config, self.global_step, self.optim_state, id2vocab})
+
 end
 
 function model:shutdown()

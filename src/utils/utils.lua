@@ -130,6 +130,7 @@ function numlist2str(label_list, visualize)
     return label_str, strlist
 end
 
+
 vocab2id = nil
 label_lines = nil
 function path2numlist(file_path, label_path)

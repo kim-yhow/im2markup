@@ -110,6 +110,7 @@ function createLSTM(input_size, num_hidden, num_layers,
   if use_attention then
     local top_h = outputs[#outputs]
     local decoder_out
+
     local decoder_attn = create_decoder_attn(num_hidden, 0, batch_size, max_encoder_l)
     decoder_attn.name = 'decoder_attn'
     decoder_out = decoder_attn({top_h, inputs[2]})
@@ -124,7 +125,7 @@ end
 function create_decoder_attn(num_hidden, simple, batch_size, max_encoder_l)
   -- inputs[1]: 2D tensor target_t (batch_l x num_hidden) and
   -- inputs[2]: 3D tensor for context (batch_l x source_l x input_size)
-  
+
   local inputs = {}
   table.insert(inputs, nn.Identity()())
   table.insert(inputs, nn.Identity()())
